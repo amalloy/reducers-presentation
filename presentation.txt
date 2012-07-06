@@ -1,0 +1,121 @@
+The reducers library is this new idea Rich has been working on that will be
+included in Clojure 1.5. We're going to talk about what a reducer is, why
+they're worth anything, and how they compare to lazy sequences. After that,
+I'll show you how to use all the existing reducers, and how to implement
+your own reducers and transformers.
+
+The first piece of background we'll need is a refresher on how reduce and
+lazy sequences currently work. Reduce takes an initial accumulator, a
+function for turning an accumulator and a value into a new accumulator, and
+a source of values to reduce over. So (reduce + 0 [1 2 3]) is evaluated
+like (+ (+ (+ 0 1) 2) 3).
+
+The first interesting thing that the reducer framework does is use a
+different abstraction for the source of values. As it is now, reduce takes
+in a sequence of values, as do most Clojure functions. And that's great,
+because it lets you be very flexible about how you construct and use your
+sequences. But there is a cost: when you call (map f coll), a new cons cell
+is created for each item in coll. This is lazy, so you won't run out of
+memory, but it costs time to allocate these temporary objects and clean
+them up.
+
+And as long as your "end goal" for the sequence is to reduce it, you don't
+need these intermediate results to exist at all! So really what a reducer
+is, is an alternative "source" for the reduce function, that provides
+values for reduce to accumulate. How does that work? Let's look at a simple
+example and see how we could rewrite it to avoid lazy sequences.
+
+(reduce * 1
+          (filter odd?
+                  (map inc [1 2 3 4])))
+
+This allocates six useless cons cells: four for the map, and two for the
+elements that filter decides to keep. But we could do this without any cons
+cells at all, if we try a little harder and use a more sophisticated reduce
+function:
+
+(reduce (fn [acc x]
+          (let [bigger (inc x)]
+            (if (odd? bigger)
+              (* acc bigger)
+              acc)))
+        1, [1 2 3 4])
+
+This is definitely more efficient, but it's a pain to write, and
+interleaves all our different bits of logic into one big ball of mud. The
+heart of the reducer library is a set of functions to combine
+reduce-functions for you in a way as readable as the reduce/filter/map we
+wrote earlier, but as efficient as the big mess here.
+
+So there's a map function and a filter function, but instead of returning a
+lazy sequence, they return a new Reducer. And with them, you can write
+stuff like:
+
+(reduce * 1
+        (r/filter odd?
+                  (r/map inc [1 2 3 4])))
+
+Now, let's see if we can make some of this magic happen ourselves. There
+are two main kinds of reducers: there are "sources", which create a reducer
+out of something else, and "transformers", which create a reducer from some
+other reducer. And they parallel ordinary lazy-sequence functions. So we can define r/repeat, which is a source, and r/take, which is a transformer.
+
+We'll start with repeat, which requires the fewest new concepts: you just
+have to implement the CollReduce protocol. The only trick needed is a way
+to stop reduction early, using the new functions `reduced` and
+`reduced?`. To indicate that early termination is desired, wrap your value
+in `reduced`; call `reduced?` to check whether someone else has asked for
+termination, and then deref to see the finished value.
+
+(defn repeat
+  ([x] (repeat Double/POSITIVE_INFINITY x))
+  ([count x]
+    (reify CollReduce
+      (coll-reduce [this f] (coll-reduce this f (f)))
+      (coll-reduce [this f init]
+        (loop [acc init, remaining count]
+          (cond (reduced? acc) @acc
+                (zero? remaining) acc
+                :else (recur (f acc x) (dec remaining))))))))
+
+So that's the basic structure of every reducer "source": you return a
+reify, or a custom deftype, that implements CollReduce. And then you
+implement the looping part of reduce, passing their reducer function new
+values according to your source's rules. Eventually either you'll run out
+of values to give them, or their reducing function will return a `reduced`
+object, meaning "okay, I'm done, no more items please".
+
+And you could implement transformers in the same way, but there are some
+functions provided in the reducers library that are shortcuts for creating
+transformers, given a way to turn their reducing function into a new
+reducing function. For example, here's the definition of r/take:
+
+(defn take [n coll]
+  (reducer coll
+   (fn [f1]
+     (let [cnt (atom n)]
+       (fn [f1 k]
+         ([ret k v]
+            (if (neg? (swap! cnt dec))
+              (reduced ret)
+              (f1 ret k v))))))))
+
+This is somewhat dense and I'm not going to describe the rfn macro, but
+basically you return a new reducer that transforms their reduce function
+into a new one that stops after a certain number of iterations. Here's how
+you could do it without the shorthand, in the same way we implemented
+repeat:
+
+(defn take [n coll]
+  (reify CollReduce
+    (coll-reduce [this f] (coll-reduce this f (f)))
+    (coll-reduce [this f init]
+      (let [remaining (atom n)]
+        (coll-reduce coll
+                     (fn [acc x]
+                       (if (neg? (swap! remaining dec))
+                         (reduced acc)
+                         (f acc x)))
+                     init)))))
+
+As you can see, unlike clojure.core/take, this transformer doesn't need to allocate new space for each temporary object; instead we layer a few functions on top of each other, and pass that final reduce function to a reducer source.
